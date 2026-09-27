@@ -164,7 +164,6 @@ function AnnotationItem({
       {a.status === 'bound' && a.lastRelocation && (
         <p className="ann-meta">
           {REASON_LABEL[a.lastRelocation.reason]}
-          {a.lastRelocation.reason === 'context-score' && `（${a.lastRelocation.score} 字）`}
           {' · '}
           {formatTime(a.lastRelocation.timestamp)}
         </p>

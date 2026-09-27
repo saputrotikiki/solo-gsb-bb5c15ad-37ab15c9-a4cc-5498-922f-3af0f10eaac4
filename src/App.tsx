@@ -714,15 +714,24 @@ export default function App() {
   // ---------- 编辑原文与重定位 ----------
 
   const applyEdit = (title: string, text: string) => {
-    const oldFingerprint = fingerprint(doc.text)
-    const textChanged = text !== doc.text
+    const oldText = doc.text
+    const oldFingerprint = fingerprint(oldText)
+    const textChanged = text !== oldText
 
     if (textChanged && doc.annotations.length > 0) {
-      const relocated = relocateAnnotations(doc.annotations, text, oldFingerprint)
+      // 以编辑前原文（oldText）与编辑后原文（text）逐标注比对：
+      // 只在原区间字符未被编辑触及（仅前方/后方插删）时跟随偏移；
+      // 原片段被删或身份无法确认（含只剩同文副本）一律进入待处理，绝不静默误绑。
+      const relocated = relocateAnnotations(doc.annotations, oldText, text, oldFingerprint)
       const auto = relocated.filter(
-        (a) => a.status === 'bound' && a.lastRelocation?.reason !== 'failed',
+        (a, i) =>
+          doc.annotations[i].status === 'bound' &&
+          a.status === 'bound' &&
+          a.lastRelocation?.reason === 'tracked',
       ).length
-      const pending = relocated.filter((a) => a.status === 'pending').length
+      const pending = relocated.filter(
+        (a, i) => doc.annotations[i].status === 'bound' && a.status === 'pending',
+      ).length
       setDoc((d) => ({
         ...d,
         title,
@@ -1398,8 +1407,6 @@ export default function App() {
                     {a.lastRelocation && a.lastRelocation.reason !== 'failed' && (
                       <p className="ann-meta">
                         {REASON_LABEL[a.lastRelocation.reason]}
-                        {a.lastRelocation.reason === 'context-score' &&
-                          `（${a.lastRelocation.score} 字）`}
                       </p>
                     )}
                   </div>

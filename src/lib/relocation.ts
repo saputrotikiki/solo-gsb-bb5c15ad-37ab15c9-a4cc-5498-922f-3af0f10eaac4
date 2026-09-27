@@ -6,8 +6,6 @@ import type {
 
 /** 绑定时截取上下文的半径（两侧字符数） */
 export const CONTEXT_RADIUS = 50
-/** 编辑后重定位时，在旧位置附近搜索的窗口半径（前后各 200 字） */
-export const LOCAL_WINDOW = 200
 
 export function fingerprint(text: string): string {
   // 长度 + 首尾摘要，用于判断文本是否发生过变化
@@ -23,182 +21,191 @@ function contextSlices(text: string, start: number, end: number) {
   }
 }
 
-export interface AnchorInput {
+/**
+ * 编辑前后两版原文之间的「单处编辑区」：
+ * 设共同前缀长度 p、共同后缀长度 s，则
+ *   旧文中被改写的区间为 [p, oldLen-s)，
+ *   新文中替换后的区间为 [p, newLen-s)。
+ * 两侧未改动的字符即标注身份可以跟随的部分；
+ * 共同前缀与后缀发生交叠时（如「abc」→「xabx」一类无法唯一归并的改动）
+ * 不建立映射，全部视为不可确认。
+ */
+export interface EditRegion {
+  /** 旧文中被改写区间的起点（含） */
+  oldStart: number
+  /** 旧文中被改写区间的终点（不含） */
+  oldEnd: number
+  /** 新文中替换区间的起点（含） */
+  newStart: number
+  /** 新文中替换区间的终点（不含） */
+  newEnd: number
+  /** 共同前后缀无法唯一归并，旧位置映射整体不可信 */
+  ambiguous: boolean
+}
+
+export function diffEditRegion(oldText: string, newText: string): EditRegion {
+  let p = 0
+  const maxPrefix = Math.min(oldText.length, newText.length)
+  while (p < maxPrefix && oldText[p] === newText[p]) p++
+
+  let s = 0
+  const maxSuffix = Math.min(oldText.length - p, newText.length - p)
+  while (s < maxSuffix && oldText[oldText.length - 1 - s] === newText[newText.length - 1 - s]) {
+    s++
+  }
+
+  // 前缀与后缀交叠意味着同一批字符同时被算作前缀和后缀，
+  // 无法确定编辑真正发生的位置，映射不可信。
+  const ambiguous = p + s > Math.min(oldText.length, newText.length)
+
+  return {
+    oldStart: p,
+    oldEnd: oldText.length - s,
+    newStart: p,
+    newEnd: newText.length - s,
+    ambiguous,
+  }
+}
+
+/**
+ * 一条旧偏移量在编辑后的映射结果。
+ * - mapped：该位置处在未改动的前缀 / 后缀中，可确定地映射到新偏移；
+ * - inside：该位置落在被改写区间内（含其边界），原字符是否保留无法确认。
+ */
+export type OffsetMapping =
+  | { kind: 'mapped'; offset: number }
+  | { kind: 'inside' }
+
+/** 把旧原文中的偏移量按编辑区映射到新原文 */
+export function mapOffset(offset: number, region: EditRegion): OffsetMapping {
+  if (region.ambiguous) return { kind: 'inside' }
+  // 未改动的前缀：偏移不变
+  if (offset <= region.oldStart) return { kind: 'mapped', offset }
+  // 未改动的后缀：整体平移（插入时 delta>0，删除时 delta<0）
+  if (offset >= region.oldEnd) {
+    return { kind: 'mapped', offset: offset - region.oldEnd + region.newEnd }
+  }
+  return { kind: 'inside' }
+}
+
+export interface TrackInput {
   quote: string
   start: number
   end: number
-  contextBefore: string
-  contextAfter: string
 }
 
-export type AnchorOutcome =
+export type TrackOutcome =
   | {
       ok: true
       start: number
       end: number
-      reason: Exclude<RelocateReason, 'failed'>
-      score: number
+      reason: Extract<RelocateReason, 'tracked'>
     }
   | {
       ok: false
       reason: 'failed'
       /** 待处理的具体原因，展示给用户，绝不静默误绑 */
       detail:
-        | 'not-found' // 全文中找不到引文
-        | 'tie' // 最高分并列
-        | 'zero-score' // 评分命中但得分为 0
+        | 'not-found' // 新原文中已找不到该引文：原片段确认被删除
+        | 'identity-lost' // 原区间被编辑触及，剩余同文副本无法确认身份
+        | 'ambiguous-edit' // 前后缀交叠，无法确认标注去向
     }
 
-/** 找出 needle 在 text 中的全部出现位置 */
-function findAllOccurrences(text: string, needle: string): number[] {
-  if (!needle) return []
-  const out: number[] = []
-  let from = 0
-  for (;;) {
-    const idx = text.indexOf(needle, from)
-    if (idx === -1) break
-    out.push(idx)
-    from = idx + 1 // 允许重叠出现
-  }
-  return out
+function findOccurrence(text: string, needle: string, from = 0): number {
+  if (!needle) return -1
+  return text.indexOf(needle, from)
 }
 
 /**
- * 前后文相同字符数评分：
- * 取候选位置左侧与旧上文末尾连续相同的字符数，
- * 加上候选位置右侧与旧下文开头连续相同的字符数。
+ * 依据编辑前后两版原文判断一条标注的去向（身份跟随，而非文本匹配）：
+ *
+ * 1. 旧区间 [start,end) 完整落在未改动的前缀或后缀中
+ *    （即编辑只发生在区间前方 / 后方 / 与区间不相交）→ 按偏移平移，
+ *    并校验新位置仍是原引文；
+ * 2. 旧区间与编辑区有交集（含端点相接的插删）：
+ *    - 新原文中已不存在该引文 → 原片段被删除（not-found）；
+ *    - 引文仍存在（哪怕只有一处）→ 只能说明存在同文副本，
+ *      无法确认哪一处是原标注，进入待处理（identity-lost）；
+ * 3. 前后缀交叠、无法唯一归并编辑区时 → 待处理（ambiguous-edit）。
+ *
+ * 关键区别：旧逻辑在「引文全文唯一命中」时会静默绑定，
+ * 删掉已标注的那处、只剩近距离同文副本时会误绑到副本上；
+ * 本逻辑只承认「原区间字符未被编辑触及」这一条身份证据。
  */
-export function contextScore(
-  text: string,
-  candidateStart: number,
-  candidateEnd: number,
-  oldBefore: string,
-  oldAfter: string,
-): number {
-  let left = 0
-  const minLeft = Math.min(oldBefore.length, candidateStart)
-  while (
-    left < minLeft &&
-    oldBefore[oldBefore.length - 1 - left] ===
-      text[candidateStart - 1 - left]
-  ) {
-    left++
+export function trackAnnotation(
+  oldText: string,
+  newText: string,
+  a: TrackInput,
+): TrackOutcome {
+  const region = diffEditRegion(oldText, newText)
+
+  if (region.ambiguous) {
+    return { ok: false, reason: 'failed', detail: 'ambiguous-edit' }
   }
 
-  let right = 0
-  const minRight = Math.min(oldAfter.length, text.length - candidateEnd)
-  while (
-    right < minRight &&
-    oldAfter[right] === text[candidateEnd + right]
-  ) {
-    right++
-  }
+  const mStart = mapOffset(a.start, region)
+  const mEnd = mapOffset(a.end, region)
 
-  return left + right
-}
-
-/**
- * 按约定优先级重定位一条标注：
- * 1. 旧位置前后 200 字内精确匹配
- * 2. 全文唯一匹配
- * 3. 前后文相同字符数评分（最高分并列或得分为 0 → 待处理）
- */
-export function findAnchor(text: string, a: AnchorInput): AnchorOutcome {
-  const occurrences = findAllOccurrences(text, a.quote)
-  if (occurrences.length === 0) return { ok: false, reason: 'failed', detail: 'not-found' }
-
-  // 策略 1：旧位置 ±LOCAL_WINDOW 内精确匹配
-  const lo = Math.max(0, a.start - LOCAL_WINDOW)
-  const hi = Math.min(text.length, a.end + LOCAL_WINDOW)
-  const local = occurrences.filter((p) => p >= lo && p + a.quote.length <= hi)
-  if (local.length === 1) {
-    return {
-      ok: true,
-      start: local[0],
-      end: local[0] + a.quote.length,
-      reason: 'local-exact',
-      score: 0,
+  // 原区间完整处在未改动区域：身份确定，按偏移跟随
+  if (mStart.kind === 'mapped' && mEnd.kind === 'mapped') {
+    const start = mStart.offset
+    const end = mEnd.offset
+    // 未改动区域中的字符原样保留，新位置必然仍是原引文；
+    // 再校验一次以防御脏数据（旧区间与旧原文不一致）。
+    if (newText.slice(start, end) === a.quote) {
+      return { ok: true, start, end, reason: 'tracked' }
     }
+    // 旧区间与旧原文本身对不上：无法确认身份
+    return findOccurrence(newText, a.quote) === -1
+      ? { ok: false, reason: 'failed', detail: 'not-found' }
+      : { ok: false, reason: 'failed', detail: 'identity-lost' }
   }
 
-  // 策略 2：全文唯一匹配
-  if (occurrences.length === 1) {
-    return {
-      ok: true,
-      start: occurrences[0],
-      end: occurrences[0] + a.quote.length,
-      reason: 'unique',
-      score: 0,
-    }
-  }
-
-  // 策略 3：对所有候选做前后文评分
-  let best = -1
-  let bestPos: number[] = []
-  for (const pos of occurrences) {
-    const s = contextScore(
-      text,
-      pos,
-      pos + a.quote.length,
-      a.contextBefore,
-      a.contextAfter,
-    )
-    if (s > best) {
-      best = s
-      bestPos = [pos]
-    } else if (s === best) {
-      bestPos.push(pos)
-    }
-  }
-
-  if (best <= 0) return { ok: false, reason: 'failed', detail: 'zero-score' }
-  if (bestPos.length > 1) return { ok: false, reason: 'failed', detail: 'tie' }
-
-  return {
-    ok: true,
-    start: bestPos[0],
-    end: bestPos[0] + a.quote.length,
-    reason: 'context-score',
-    score: best,
-  }
+  // 旧区间被编辑触及：只报告原片段是否还存在，绝不替用户选副本
+  return findOccurrence(newText, a.quote) === -1
+    ? { ok: false, reason: 'failed', detail: 'not-found' }
+    : { ok: false, reason: 'failed', detail: 'identity-lost' }
 }
 
 export const REASON_LABEL: Record<RelocateReason, string> = {
-  'local-exact': '原位附近精确匹配',
-  unique: '全文唯一匹配',
-  'context-score': '前后文评分匹配',
+  tracked: '编辑前后原文比对，原位跟随',
   failed: '未能自动重定位',
+  // 旧版本原因（历史数据展示用，新编辑不再产生）
+  'local-exact': '原位附近精确匹配（旧版算法）',
+  unique: '全文唯一匹配（旧版算法）',
+  'context-score': '前后文评分匹配（旧版算法）',
 }
 
 export const FAIL_DETAIL_LABEL: Record<string, string> = {
-  'not-found': '原文中已找不到该引文，需要手动重新选择',
-  tie: '多处候选的前后文评分相同，为避免误绑需人工确认',
-  'zero-score': '候选位置与旧前后文没有相同字符，需人工确认',
+  'not-found': '原标注片段已随编辑删除，新原文中找不到该引文，需要手动重新选择',
+  'identity-lost':
+    '编辑触及了原标注区间，原文中仍有相同引文但无法确认哪一处是原标注（避免误绑到同文副本），请手动确认绑定位置',
+  'ambiguous-edit': '本次改动无法唯一确定编辑位置，标注去向需要手动确认',
 }
 
 /**
- * 批量重定位。返回新的标注数组：
- * - 成功：更新区间与上下文快照，写入 lastRelocation 诊断
- * - 失败：置为 pending，保留旧位置信息用于展示
+ * 批量重定位（身份跟随版）。返回新的标注数组：
+ * - 成功：更新区间与上下文快照，写入 lastRelocation 诊断；
+ * - 失败：置为 pending，保留旧位置信息用于展示；
+ * - 原本就 pending 的标注不参与重定位：不做文本猜测、不静默恢复，
+ *   仍可通过手动重绑恢复。
  */
 export function relocateAnnotations(
   annotations: Annotation[],
+  oldText: string,
   newText: string,
   sourceFingerprint: string,
 ): Annotation[] {
   const now = Date.now()
   return annotations.map((a) => {
-    const res = findAnchor(newText, {
-      quote: a.quote,
-      start: a.start,
-      end: a.end,
-      contextBefore: a.contextBefore,
-      contextAfter: a.contextAfter,
-    })
+    // 待处理标注的身份已无法确认，任何自动绑定都是猜测，保持待处理
+    if (a.status === 'pending') return a
+
+    const res = trackAnnotation(oldText, newText, a)
 
     const base: RelocationInfo = {
       reason: res.reason,
-      score: res.ok ? res.score : 0,
+      score: 0,
       oldStart: a.start,
       oldEnd: a.end,
       sourceFingerprint,
@@ -230,7 +237,7 @@ export function relocateAnnotations(
   })
 }
 
-/** 用用户重新拖选的区间完成手动绑定 */
+/** 用用户重新拖选的区间完成手动绑定（待处理标注随时可由此恢复） */
 export function rebindAnnotation(
   a: Annotation,
   text: string,

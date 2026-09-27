@@ -2256,4 +2256,134 @@ container3.remove()
   cp2.remove()
 }
 
+// 锚点误绑回归（编辑前后原文比对）：
+// 同一引文在相距不足 200 字处出现两次；编辑删除「已标注的那处」后，
+// 不得静默绑到剩余副本——标注应进入待处理并说明原因，手动重绑仍可恢复。
+{
+  const { setSelectionRange } = await import('../src/lib/dom')
+  const setNativeValue = (el: HTMLInputElement | HTMLTextAreaElement, v: string) => {
+    const proto =
+      el instanceof window.HTMLTextAreaElement
+        ? window.HTMLTextAreaElement.prototype
+        : window.HTMLInputElement.prototype
+    Object.getOwnPropertyDescriptor(proto, 'value')!.set!.call(el, v)
+    el.dispatchEvent(new window.Event('input', { bubbles: true }))
+  }
+  const clickButton = (rootEl: ParentNode, text: string) => {
+    const btn = [...rootEl.querySelectorAll('button')].find(
+      (b) => b.textContent?.trim() === text,
+    ) as HTMLButtonElement | undefined
+    assert.ok(btn, `应存在按钮「${text}」`)
+    btn!.click()
+    return btn!
+  }
+  const wait = () => new Promise<void>((resolve) => setTimeout(resolve, 150))
+  const saved = () => JSON.parse(localStorage.getItem('anchor-annotation-console:v1')!)
+
+  const dupText = '开头铺垫文字：【相同引文】随后是十几字的间隔文字，再次出现【相同引文】全文结束。'
+  const firstPos = dupText.indexOf('【相同引文】')
+  const dupDoc = {
+    title: '重复引文文档',
+    text: dupText,
+    updatedAt: Date.now(),
+    annotations: [
+      {
+        id: 'dup_a',
+        quote: '【相同引文】',
+        start: firstPos,
+        end: firstPos + 6,
+        note: '标注第一处',
+        tags: ['重点'],
+        status: 'bound',
+        createdAt: 1,
+        updatedAt: 1,
+        contextBefore: dupText.slice(Math.max(0, firstPos - 50), firstPos),
+        contextAfter: dupText.slice(firstPos + 6, firstPos + 6 + 50),
+      },
+    ],
+  }
+  // 前置条件：两处相距不足 200 字
+  assert.ok(dupText.lastIndexOf('【相同引文】') - firstPos < 200)
+  localStorage.setItem('anchor-annotation-console:v1', JSON.stringify(dupDoc))
+  const cd = document.createElement('div')
+  cd.id = 'rootdup'
+  document.body.appendChild(cd)
+  const dr = createRoot(cd)
+  await new Promise<void>((resolve) => {
+    dr.render(React.createElement(React.StrictMode, null, React.createElement(App)))
+    setTimeout(resolve, 300)
+  })
+
+  // 场景 A：只在标注前方插入文字 → 自动跟随，仍绑在「带随后间隔文字」的原位（非第二处副本）
+  clickButton(cd, '粘贴 / 编辑原文')
+  await wait()
+  const editor = cd.querySelector('.editor-textarea') as HTMLTextAreaElement
+  setNativeValue(editor, '>>>插入前缀<<<' + dupText)
+  clickButton(cd, '完成编辑')
+  await wait()
+  let data = saved()
+  assert.strictEqual(data.annotations[0].status, 'bound', '前方插入后应自动跟随')
+  assert.strictEqual(data.annotations[0].lastRelocation.reason, 'tracked')
+  assert.strictEqual(data.annotations[0].start, firstPos + '>>>插入前缀<<<'.length)
+  assert.strictEqual(
+    data.text.slice(data.annotations[0].end, data.annotations[0].end + 3),
+    '随后是',
+    '跟随的必须是原第一处，而非后面的同文副本',
+  )
+
+  // 场景 B（核心回归）：删除已标注的第一处（连同其后几个字），第二处副本仍在
+  clickButton(cd, '粘贴 / 编辑原文')
+  await wait()
+  const curText: string = saved().text
+  const p = curText.indexOf('【相同引文】')
+  const deleted = curText.slice(0, p) + curText.slice(p + '【相同引文】随后是'.length)
+  assert.ok(deleted.includes('【相同引文】'), '前置条件：剩余副本仍在')
+  assert.strictEqual(deleted.indexOf('【相同引文】'), deleted.lastIndexOf('【相同引文】'),
+    '前置条件：只剩一处同文副本')
+  setNativeValue(cd.querySelector('.editor-textarea') as HTMLTextAreaElement, deleted)
+  clickButton(cd, '完成编辑')
+  await wait()
+
+  data = saved()
+  assert.strictEqual(data.annotations[0].status, 'pending',
+    '删掉已标注处后只剩同文副本，必须进入待处理而非静默误绑')
+  assert.ok(
+    data.annotations[0].pendingReason?.includes('无法确认'),
+    `待处理原因应说明身份无法确认，实际：${data.annotations[0].pendingReason}`,
+  )
+  assert.ok(cd.textContent?.includes('待处理'), '界面应展示待处理状态')
+  // 全文仅此一条标注且已 pending：正文不应出现任何标注高亮（不得落到剩余副本上）
+  const viewAfter = cd.querySelector('.text-view') as HTMLElement
+  assert.strictEqual(
+    viewAfter.querySelectorAll('mark.hl').length,
+    0,
+    '待处理标注不应在剩余副本处渲染高亮',
+  )
+
+  // 场景 C：手动重绑可恢复 —— 拖选剩余副本并确认
+  const rebind = [...cd.querySelectorAll('button')].find((b) =>
+    b.textContent?.includes('重新选择片段'),
+  ) as HTMLButtonElement
+  assert.ok(rebind, '待处理标注应提供手动重绑入口')
+  rebind.click()
+  await wait()
+  const remainPos = deleted.indexOf('【相同引文】')
+  const viewForRebind = cd.querySelector('.text-view') as HTMLElement
+  assert.ok(setSelectionRange(viewForRebind!, remainPos, remainPos + 6))
+  viewForRebind!.dispatchEvent(new window.MouseEvent('mouseup', { bubbles: true }))
+  await wait()
+  assert.ok(cd.textContent?.includes('确认绑定'), '拖选后应出现确认绑定弹层')
+  clickButton(cd, '确认绑定')
+  await wait()
+  data = saved()
+  assert.strictEqual(data.annotations[0].status, 'bound', '手动重绑后恢复已绑定')
+  assert.strictEqual(data.annotations[0].start, remainPos)
+  assert.strictEqual(data.annotations[0].end, remainPos + 6)
+  assert.strictEqual(data.annotations[0].pendingReason, undefined)
+  console.log('  ✓ 锚点误绑回归：删除已标注处后不绑同文副本而进入待处理，前方插入自动跟随，手动重绑可恢复')
+
+  dr.unmount()
+  cd.remove()
+}
+
 console.log('\n全部渲染冒烟测试通过')
