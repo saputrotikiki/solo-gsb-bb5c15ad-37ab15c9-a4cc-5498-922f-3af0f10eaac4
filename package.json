@@ -1,0 +1,26 @@
+{
+  "name": "anchor-annotation-console",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "原文锚点标注台 —— 拖选原文片段，添加标签与备注，编辑后按锚点规则自动重定位。",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "node test/run.mjs"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "esbuild": "^0.21.5",
+    "jsdom": "^29.1.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

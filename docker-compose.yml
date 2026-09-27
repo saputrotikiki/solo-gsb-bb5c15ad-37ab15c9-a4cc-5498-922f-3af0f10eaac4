@@ -1,0 +1,8 @@
+services:
+  web:
+    build: .
+    image: anchor-annotation-console:latest
+    container_name: anchor-annotation-console
+    ports:
+      - "8080:80"
+    restart: unless-stopped
