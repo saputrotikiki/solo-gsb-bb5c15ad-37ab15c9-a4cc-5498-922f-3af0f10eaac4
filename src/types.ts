@@ -5,10 +5,12 @@ export type AnnotationStatus = 'bound' | 'pending'
 
 /** 上一次重定位所走的策略 */
 export type RelocateReason =
-  | 'local-exact' // 旧位置前后 200 字内精确匹配
-  | 'unique' // 全文唯一匹配
-  | 'context-score' // 前后文相同字符数评分
-  | 'failed' // 未找到 / 并列 / 得分为 0
+  | 'identity-continue' // 编辑前后逐字符对齐确认：原标注区间仍在，仅位置随前方插删平移
+  | 'failed' // 原片段被删 / 身份无法确认 / 引文消失
+  // 以下为旧版本（按位置窗口 + 前后文评分重定位）遗留值，仅用于历史数据展示
+  | 'local-exact'
+  | 'unique'
+  | 'context-score'
 
 export interface RelocationInfo {
   reason: RelocateReason

@@ -714,11 +714,15 @@ export default function App() {
   // ---------- 编辑原文与重定位 ----------
 
   const applyEdit = (title: string, text: string) => {
-    const oldFingerprint = fingerprint(doc.text)
-    const textChanged = text !== doc.text
+    const oldText = doc.text
+    const oldFingerprint = fingerprint(oldText)
+    const textChanged = text !== oldText
 
     if (textChanged && doc.annotations.length > 0) {
-      const relocated = relocateAnnotations(doc.annotations, text, oldFingerprint)
+      // 结合编辑前后原文逐条判定身份：
+      // 原片段仍在（仅前后插删）→ 自动平移；原片段被删只剩同文副本、
+      // 或无法确认身份 → 进入待处理，绝不在「局部唯一命中」上静默误绑
+      const relocated = relocateAnnotations(doc.annotations, oldText, text, oldFingerprint)
       const auto = relocated.filter(
         (a) => a.status === 'bound' && a.lastRelocation?.reason !== 'failed',
       ).length
